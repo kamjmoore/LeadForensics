@@ -1,0 +1,166 @@
+"""
+Lead Forensics ingestion + matching Azure Function.
+
+Timer-triggered function that:
+  1. pulls the previous day's website-visitor data from the Lead Forensics API
+  2. loads it into SQL Server (LF_SiteVisits)
+  3. fetches company details for any new visitor business IDs (LF_BusinessNames)
+  4. fuzzy-matches visitor company names against property owner / manager
+     reference names and stores the scored matches (LF_Costar_Scores)
+
+The scored output feeds a Power BI report used by the sales team.
+
+Secrets (API keys, DB credentials) are read at runtime from Azure Key Vault;
+nothing sensitive is stored in source control.
+"""
+
+import datetime as dt
+import logging
+import os
+import time
+from datetime import datetime, timezone
+
+import azure.functions as func
+import pandas as pd
+import requests
+from azure.identity import DefaultAzureCredential
+from azure.keyvault.secrets import SecretClient
+from sqlalchemy import create_engine
+
+from matching import match_companies
+
+app = func.FunctionApp()
+
+LF_API_BASE = "https://interact.leadforensics.com/WebApi_v2"
+API_CALL_DELAY_SECONDS = 1  # spacing between calls to stay under the LF rate limit
+
+
+def get_secret(name):
+    """Fetches a secret value from the Azure Key Vault named by KeyVaultUrl."""
+    credential = DefaultAzureCredential()
+    secret_client = SecretClient(
+        vault_url=os.environ["KeyVaultUrl"], credential=credential
+    )
+    return str(secret_client.get_secret(name).value)
+
+
+def lf_headers(client_id, api_key):
+    """Builds the Lead Forensics API auth headers."""
+    return {
+        "accept": "application/json",
+        "ClientID": client_id,
+        "Authorization-Token": api_key,
+    }
+
+
+def get_visits(headers, day, month, year):
+    """Pulls one day of site-visit records from the Lead Forensics API."""
+    url = (
+        f"{LF_API_BASE}/Visit/GetAllVisits"
+        f"?datefrom={day}-{month}-{year} 00:00:00"
+        f"&dateto={day}-{month}-{year} 23:59:59"
+        f"&pagesize=999999&pageno=1"
+    )
+    response = requests.get(url, headers=headers)
+    response.raise_for_status()
+    return pd.json_normalize(
+        pd.DataFrame.from_dict(response.json())["SiteVisitList"]
+    )
+
+
+def get_business(headers, business_id):
+    """Fetches company details for a single Lead Forensics business ID."""
+    url = f"{LF_API_BASE}/Business/GetBusiness?businessid={business_id}"
+    response = requests.get(url, headers=headers)
+    response.raise_for_status()
+    return pd.DataFrame(response.json(), index=[1])
+
+
+# Daily at 05:30. The original schedule was "0 */5 * * * *" (every five
+# minutes) with run_on_startup=True, which re-pulled the same day's data
+# hundreds of times and appended duplicates on each run.
+@app.schedule(schedule="0 30 5 * * *", arg_name="myTimer",
+              run_on_startup=False, use_monitor=False)
+def LeadForensicsFunc(myTimer: func.TimerRequest) -> None:
+    """Runs daily at 05:30 and ingests the previous day's visitor data."""
+    if myTimer.past_due:
+        logging.info("The timer is past due!")
+    logging.info("Lead Forensics function started at %s",
+                 datetime.now(timezone.utc))
+
+    # --- secrets + connection -------------------------------------------
+    lf_client = get_secret("LF-Client")
+    lf_api = get_secret("LF-API-Key")
+    ds_server = get_secret("DS-DB-Name")
+    ds_user = get_secret("DataScience-DB-User")
+    ds_password = get_secret("DataScience-DB-Password")
+
+    engine = create_engine(
+        f"mssql+pyodbc://{ds_user}:{ds_password}@{ds_server}/Enterprise_DB"
+        "?driver=ODBC+Driver+17+for+SQL+Server",
+        fast_executemany=True,
+    )
+    headers = lf_headers(lf_client, lf_api)
+
+    # --- 1. pull yesterday's site visits --------------------------------
+    yesterday = datetime.now() - dt.timedelta(days=1)
+    visits = get_visits(headers, yesterday.day, yesterday.month, yesterday.year)
+
+    visits["StartDateTime"] = pd.to_datetime(visits["StartDateTime"])
+    visits["EndDateTime"] = pd.to_datetime(visits["EndDateTime"])
+    visits["Duration"] = (
+        (visits["EndDateTime"] - visits["StartDateTime"]) / pd.Timedelta(minutes=1)
+    )
+    visits.to_sql("LF_SiteVisits", engine, if_exists="append",
+                  index=False, chunksize=100000)
+    logging.info("Loaded %d site visits", len(visits))
+
+    # --- 2. fetch company details for new business IDs -----------------
+    known_ids = pd.read_sql(
+        "SELECT DISTINCT BusinessID FROM LF_BusinessNames", engine
+    )["BusinessID"].to_list()
+    new_ids = [bid for bid in visits["BusinessID"].unique() if bid not in known_ids]
+
+    business_frames = []
+    missed_ids = []
+    for business_id in new_ids:
+        time.sleep(API_CALL_DELAY_SECONDS)  # stay under the API rate limit
+        try:
+            business_frames.append(get_business(headers, business_id))
+        except Exception:
+            logging.warning("Failed to fetch business %s", business_id)
+            missed_ids.append(business_id)
+
+    if missed_ids:
+        # The original assigned the list to missing_df and then called
+        # .to_sql() on it -- a list has no .to_sql(). Wrap it in a frame.
+        pd.DataFrame({"BusinessID": missed_ids}).to_sql(
+            "LF_Missing_Businesses", engine, if_exists="append", index=False
+        )
+
+    if not business_frames:
+        # The original called pd.concat() unconditionally, which raises on
+        # an empty list when there are no new businesses.
+        logging.info("No new businesses to process; finishing.")
+        return
+
+    businesses = pd.concat(business_frames)
+    businesses.to_sql("LF_BusinessNames", engine, if_exists="append",
+                      index=False, chunksize=100000)
+
+    # --- 3. match visitor companies to property owner reference data ---
+    reference_query = (
+        "WITH CTE AS (SELECT DISTINCT [True Owner Name] AS Name_1 "
+        "FROM DS_Staging.dbo.CS_SitesOfInterest WHERE [True Owner Name] IS NOT NULL), "
+        "CTE2 AS (SELECT DISTINCT [Property Manager Name] AS Name_1 "
+        "FROM DS_Staging.dbo.CS_SitesOfInterest "
+        "WHERE [Property Manager Name] IS NOT NULL), "
+        "CTE3 AS (SELECT * FROM CTE UNION SELECT * FROM CTE2) SELECT * FROM CTE3"
+    )
+    reference_names = pd.read_sql(reference_query, engine)["Name_1"].to_list()
+    visitor_names = businesses["Name"].to_list()
+
+    matches = match_companies(visitor_names, reference_names, threshold=70)
+    matches.to_sql("LF_Costar_Scores", engine, if_exists="append",
+                   index=False, chunksize=100000)
+    logging.info("Stored %d matches at or above the score threshold", len(matches))

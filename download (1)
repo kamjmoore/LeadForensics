@@ -1,0 +1,75 @@
+"""
+Unit tests for the company-name matching logic in matching.py.
+
+Run from the repository root with either:
+    python -m pytest tests/
+    python -m unittest discover tests
+"""
+
+import os
+import sys
+import unittest
+
+# Make the repo root importable when tests are run directly.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from matching import normalize_name, match_companies
+
+
+class TestNormalizeName(unittest.TestCase):
+
+    def test_lowercases_and_strips_whitespace(self):
+        self.assertEqual(normalize_name("Acme Holdings"), "acme")
+
+    def test_removes_corporate_stopwords(self):
+        self.assertEqual(normalize_name("Acme Group LLC"), "acme")
+        self.assertEqual(normalize_name("Acme Properties"), "acme")
+
+    def test_returns_none_for_only_stopwords(self):
+        self.assertIsNone(normalize_name("Holdings Group LLC"))
+
+    def test_returns_none_for_empty_or_missing(self):
+        self.assertIsNone(normalize_name(""))
+        self.assertIsNone(normalize_name(None))
+
+    def test_equivalent_names_normalize_equal(self):
+        # The whole point: these should reduce to the same comparison key.
+        self.assertEqual(
+            normalize_name("Riverside Property Group LLC"),
+            normalize_name("Riverside Properties Inc"),
+        )
+
+
+class TestMatchCompanies(unittest.TestCase):
+
+    def test_output_columns(self):
+        df = match_companies(["Acme Inc"], ["Acme LLC"])
+        self.assertEqual(list(df.columns), ["CoStar", "LeadForensics", "Score"])
+
+    def test_strong_match_survives_threshold(self):
+        df = match_companies(
+            ["Riverside Properties"], ["Riverside Property Group"]
+        )
+        self.assertEqual(len(df), 1)
+        self.assertGreaterEqual(df["Score"].iloc[0], 70)
+
+    def test_weak_match_filtered_by_threshold(self):
+        df = match_companies(["Acme Industries"], ["Zenith Holdings Group"])
+        self.assertEqual(len(df), 0)
+
+    def test_threshold_is_configurable(self):
+        df = match_companies(
+            ["Acme Industries"], ["Zenith Holdings Group"], threshold=0
+        )
+        self.assertEqual(len(df), 1)
+
+    def test_all_stopword_names_produce_no_rows(self):
+        # "Holdings Group LLC" normalizes to None and is skipped.
+        df = match_companies(
+            ["Holdings Group LLC"], ["Acme Inc"], threshold=0
+        )
+        self.assertEqual(len(df), 0)
+
+
+if __name__ == "__main__":
+    unittest.main()
